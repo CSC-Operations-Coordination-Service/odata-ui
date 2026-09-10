@@ -132,6 +132,17 @@ jobs:
   # same security settings.
   # ---------------------------------------------------------------------------
   frontend-ci:
+    # node-workflow.yml delegates to docker-build.yml, whose `docker` job declares
+    # `packages: write` unconditionally (it supports pushing to GHCR). A called
+    # workflow cannot be granted more than
+    # its caller holds, and permissions are validated when the file is parsed -
+    # not when the job runs - so this is required even though push-to-ghcr is
+    # false here and nothing is ever pushed to GHCR. Without it the whole file is
+    # rejected: "the nested job 'docker' is requesting 'packages: write', but is
+    # only allowed 'packages: none'".
+    permissions:
+      contents: read
+      packages: write
     uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@develop
     with:
       working-directory: frontend
@@ -167,6 +178,16 @@ jobs:
   backend-image:
     needs: backend-test
     if: github.event_name != 'pull_request'
+    # docker-build.yml's `docker` job declares `packages: write` unconditionally
+    # (it supports pushing to GHCR). A called workflow cannot be granted more than
+    # its caller holds, and permissions are validated when the file is parsed -
+    # not when the job runs - so this is required even though push-to-ghcr is
+    # false here and nothing is ever pushed to GHCR. Without it the whole file is
+    # rejected: "the nested job 'docker' is requesting 'packages: write', but is
+    # only allowed 'packages: none'".
+    permissions:
+      contents: read
+      packages: write
     uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: odata-ui-backend
@@ -222,6 +243,16 @@ jobs:
   frontend-image:
     needs: frontend-ci
     if: github.event_name != 'pull_request'
+    # docker-build.yml's `docker` job declares `packages: write` unconditionally
+    # (it supports pushing to GHCR). A called workflow cannot be granted more than
+    # its caller holds, and permissions are validated when the file is parsed -
+    # not when the job runs - so this is required even though push-to-ghcr is
+    # false here and nothing is ever pushed to GHCR. Without it the whole file is
+    # rejected: "the nested job 'docker' is requesting 'packages: write', but is
+    # only allowed 'packages: none'".
+    permissions:
+      contents: read
+      packages: write
     uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: odata-ui-frontend
