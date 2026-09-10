@@ -1,0 +1,150 @@
+# Production stack for Docker Swarm. Self-contained - it does NOT layer onto
+# docker-compose.yml.
+#
+#   printf '%s' "<fernet key>" | docker secret create odata_ui_secret_key -
+#   set -a && . ./.env && set +a
+#   docker stack deploy -c odata-ui.stack.yml odata-ui-prod
+#
+# `docker stack deploy` does not read .env, so the variables have to be exported into
+# the shell first - that is what the `set -a` line does. SECRET_KEY is a swarm secret
+# rather than a variable, so it never lands in the service spec where
+# `docker service inspect` would show it.
+#
+# Nothing is published. The frontend is reached through the swarm Traefik ingress
+# (the `ingress` stack in maas-deploy) on
+#
+#   http://<NODE_IP>/odata-ui/frontend
+#
+# and the backend is not routed at all: browser API calls go to the frontend
+# origin, and Next rewrites /api/* to backend:8000 across the overlay network (see
+# frontend/next.config.mjs).
+#
+# The ingress does NOT strip the path prefix, so the frontend image must be built
+# with BASE_PATH=/odata-ui/frontend and NEXT_PUBLIC_API_URL=/odata-ui/frontend -
+# CI does that. A prefix stripped from an app that emits absolute asset URLs is
+# the classic "blank page, no CSS" failure.
+#
+# Swarm silently ignores depends_on, restart, security_opt and the short `tmpfs` key,
+# so this file uses deploy.* and long-syntax tmpfs mounts instead.
+version: "3.8"
+
+x-logging: &default-logging
+  driver: loki
+  options:
+    loki-url: "http://127.0.0.1:3100/loki/api/v1/push"
+    loki-retries: "5"
+    loki-batch-size: "400"
+    loki-external-labels: "stack=odata-ui-prod,service={{.Name}}"
+
+services:
+  backend:
+    # IMAGE_PREFIX is the registry host WITH a trailing slash, or empty to run the
+    # image already present in each node's local store - then deploy with
+    # --resolve-image never, or swarm resolves the bare tag against Docker Hub.
+    # The stack parser has no conditional-suffix form, so the slash lives in the
+    # value; `${IMAGE_REGISTRY:+$IMAGE_REGISTRY/}` silently does not work here.
+    image: ${IMAGE_PREFIX-}odata-ui-backend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    environment:
+      # Read from the swarm secret declared at the bottom of this file.
+      SECRET_KEY_FILE: /run/secrets/odata_ui_secret_key
+      DB_PATH: /data/odata_ui.db
+      # Nothing is cross-origin: the browser only ever talks to the frontend.
+      CORS_ORIGINS: ""
+    secrets:
+      - odata_ui_secret_key
+    volumes:
+      - odata-ui-data:/data
+      - type: tmpfs
+        target: /tmp
+    # /data is the volume; nothing else needs to be writable.
+    read_only: true
+    networks:
+      - internal
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+      update_config:
+        # SQLite tolerates exactly one writer, so the old task must be gone before
+        # the new one starts. Never start-first here.
+        order: stop-first
+      resources:
+        limits:
+          memory: 512M
+      placement:
+        constraints:
+          - node.labels.role == ${DB_NODE_ROLE:-database}
+          # SQLite is one file on a node-local volume, so the task has to come back on
+          # the SAME node every time. The role label alone does not guarantee that if
+          # more than one node carries it: a reschedule onto a sibling would come up
+          # with an empty database. The replicas label narrows it to a single node.
+    logging: *default-logging
+
+  frontend:
+    # IMAGE_PREFIX is the registry host WITH a trailing slash, or empty to run the
+    # image already present in each node's local store - then deploy with
+    # --resolve-image never, or swarm resolves the bare tag against Docker Hub.
+    # The stack parser has no conditional-suffix form, so the slash lives in the
+    # value; `${IMAGE_REGISTRY:+$IMAGE_REGISTRY/}` silently does not work here.
+    image: ${IMAGE_PREFIX-}odata-ui-frontend:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    volumes:
+      # Next writes its fetch cache here at runtime even without ISR.
+      - type: tmpfs
+        target: /app/.next/cache
+      - type: tmpfs
+        target: /tmp
+    read_only: true
+    networks:
+      - internal
+      # Traefik can only reach a backend it shares a network with.
+      - traefik
+    deploy:
+      # Stateless, so this can be scaled up freely.
+      replicas: 1
+      restart_policy:
+        condition: any
+      update_config:
+        order: start-first
+        parallelism: 1
+      resources:
+        limits:
+          memory: 512M
+      # Ingress. Service labels, i.e. nested under deploy: labels declared at
+      # service level are container labels and the swarm provider ignores them.
+      #
+      # The ingress stack generates PathPrefix(/<stack>/<service>) on its own, so
+      # deploying this file as `odata-ui` would already yield /odata-ui/frontend
+      # with no rule label at all. It deploys as odata-ui-prod, whose generated
+      # rule would be /odata-ui-prod/frontend, so the rule is spelled out instead.
+      #
+      # As soon as any traefik.http.routers.<name>.* label exists the router is
+      # named <name> and binds to the service of the same name - router and
+      # service MUST therefore share it, here odata-ui-frontend.
+      labels:
+        - "traefik.enable=true"
+        # This service sits on two overlay networks; without this Traefik may
+        # dial the wrong one and answer 502. Traefik v3 spelling - v2 called it
+        # traefik.docker.network.
+        - "traefik.swarm.network=traefik"
+        - "traefik.http.routers.odata-ui-frontend.rule=PathPrefix(`/odata-ui/frontend`)"
+        - "traefik.http.routers.odata-ui-frontend.entrypoints=web"
+        # No strip middleware on purpose: the image is built with basePath, so
+        # Next expects the full prefixed path. This must match BASE_PATH.
+        # Swarm cannot infer the port, so Traefik requires it explicitly.
+        - "traefik.http.services.odata-ui-frontend.loadbalancer.server.port=3000"
+    logging: *default-logging
+
+networks:
+  internal:
+    driver: overlay
+  # Created once per cluster, outside this stack:
+  #   docker network create --driver overlay traefik
+  traefik:
+    external: true
+
+volumes:
+  odata-ui-data:
+
+secrets:
+  odata_ui_secret_key:
+    external: true

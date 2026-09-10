@@ -75,7 +75,7 @@ cannot affect the other environment:
 | file | role |
 | --- | --- |
 | `docker-compose.yml` | Development. `docker compose up` — published ports, bind mounts, live reload. |
-| `docker-compose.prod.yml` | Production, as a Docker Swarm stack. Registry images, no build step. |
+| `odata-ui.stack.yml` | Production, as a Docker Swarm stack. Registry images, no build step. |
 
 The trade-off of full isolation: a new backend setting has to be added to both files.
 There is deliberately no `docker-compose.override.yml` — it would auto-load and merge
@@ -86,9 +86,8 @@ into whichever file you named, which is exactly what these files are built to av
 Every page is a client component, so **all API calls come from the browser**. The
 frontend therefore proxies them: `rewrites()` in `frontend/next.config.mjs` forwards
 `/api/*` to `backend:8000` over the internal network. The browser only ever addresses
-the frontend, which means the backend publishes no port, `NEXT_PUBLIC_API_URL` is
-baked in as `/` — one image, no hostname, valid in any environment — and `CORS_ORIGINS`
-is empty because nothing is cross-origin.
+the frontend, which means the backend publishes no port, no hostname is baked into
+either image, and `CORS_ORIGINS` is empty because nothing is cross-origin.
 
 Development goes through the same proxy, so a proxy problem surfaces locally rather
 than only on deploy. The backend port is still published there for `/docs`.
@@ -101,17 +100,23 @@ resolve; set `BACKEND_INTERNAL_URL=http://localhost:8000` for the frontend.
 ```bash
 # once per cluster - see .env.prod.example for generating the key
 printf '%s' "<fernet key>" | docker secret create odata_ui_secret_key -
+# once per cluster - the overlay the Traefik ingress stack shares with its backends
+docker network create --driver overlay traefik
 
 cp .env.prod.example .env      # fill in IMAGE_PREFIX, IMAGE_TAG, DB_NODE_REPLICA
 set -a && . ./.env && set +a   # stack deploy does not read .env itself
-docker stack deploy -c docker-compose.prod.yml odata-ui-prod
+docker stack deploy -c odata-ui.stack.yml odata-ui-prod
 ```
+
+The stack publishes **no port**. The UI is served by the swarm Traefik ingress at
+<http://NODE_IP/odata-ui/frontend> — any node IP answers, since Traefik itself is
+published through the routing mesh. See *Ingress* below.
 
 Deploy and roll back by tag — never `latest`, which makes the running version
 unknowable and turns a restart into a deploy:
 
 ```bash
-IMAGE_TAG=1.2.3 docker stack deploy -c docker-compose.prod.yml odata-ui-prod
+IMAGE_TAG=1.2.3 docker stack deploy -c odata-ui.stack.yml odata-ui-prod
 ```
 
 Three swarm-specific things the stack file already accounts for, each of which fails
@@ -143,7 +148,157 @@ built by the reusable `docker-build.yml` workflow. `IMAGE_PREFIX` carries its ow
 trailing slash, because the stack parser cannot append one conditionally; leaving it
 empty runs images preloaded into each node's local store, which then needs
 `docker stack deploy --resolve-image never` or swarm resolves the bare tag against
-Docker Hub. The frontend build must pass `NEXT_PUBLIC_API_URL=/`.
+Docker Hub. The frontend build must pass `BASE_PATH` and `NEXT_PUBLIC_API_URL`, both
+set to the ingress path — see *Ingress*.
+
+### Ingress
+
+The frontend is exposed through the shared Traefik ingress (the `ingress` stack in
+`maas-deploy`), on the convention that stack uses — `/<stack>/<service>/`:
+
+```
+http://<NODE_IP>/odata-ui/frontend
+```
+
+Three labels under `deploy.labels` do it, and `deploy` is not optional: labels set at
+service level are *container* labels and Traefik's swarm provider ignores them. The
+service also joins the external `traefik` overlay, because Traefik can only reach a
+backend it shares a network with.
+
+Two things about this route are worth knowing before changing it:
+
+- **The prefix is not stripped, by design.** Next.js emits absolute asset URLs, so a
+  stripped prefix gives the classic blank page with no CSS: the HTML loads, then the
+  browser asks for `/_next/static/...` at the host root and Traefik has no route for
+  it. Instead the app is *told* its sub-path via `basePath` in
+  `frontend/next.config.mjs` — the same approach Grafana's `serve_from_sub_path` and
+  RabbitMQ's `management.path_prefix` take in the sibling stacks.
+- **The path is baked into the image, not configured at deploy time.** `basePath` is
+  inlined by Next at build time into every asset URL, every `<Link>` and the `/api/*`
+  rewrite, and `NEXT_PUBLIC_API_URL` is inlined into the `fetch()` calls, which Next
+  does *not* prefix for you. Both are build args set by CI. Changing the route means
+  rebuilding the image and updating the router rule together — editing only the label
+  leaves a UI whose assets 404.
+
+The router and service are both named `odata-ui-frontend`: once any
+`traefik.http.routers.<name>.*` label is present the router takes that name and binds
+to the service of the same name, so the two must match.
+
+The rule is spelled out rather than inherited. The ingress generates
+`PathPrefix(/<stack>/<service>)` from the stack namespace on its own, which would be
+`/odata-ui-prod/frontend` for this file — deploying it as `odata-ui` instead would
+produce `/odata-ui/frontend` with no rule label at all.
+
+## CI/CD
+
+[`.github/workflows/odata-ui.yml`](.github/workflows/odata-ui.yml) is a thin caller: it
+owns the triggers and delegates every step of real work to the reusable workflows in
+[workflow-catalog](https://github.com/CSC-Operations-Coordination-Service/workflow-catalog)
+— `gitleaks.yml`, `node-workflow.yml` and `docker-build.yml`.
+
+| trigger | what runs | what is pushed |
+| --- | --- | --- |
+| pull request | gitleaks, backend pytest, frontend `next build` | nothing |
+| push to `main` or `develop` | the above + both images | **dev** Nexus registry, tagged with the branch and `sha-<short>` |
+| tag `x.y.z` | the above + SBOMs + Cosign signatures | **prod** Nexus registry, tagged `x.y.z`, `x.y`, `latest` |
+
+Nothing is pushed from a pull request by design: `docker-build.yml` always pushes what
+it builds, so it is not called there at all.
+
+Two deviations from the catalog's usual shape, both deliberate:
+
+- **The backend tests run in a local job**, not via `python-ci.yml`. That primitive is
+  shaped for a Nexus-published package — tox, `setuptools_scm`, twine — and this
+  backend is a deployed application that is never published as a wheel. The job still
+  reuses the catalog's `nexus-context` action, so pip installs from the same index as
+  every other build.
+- **`node-workflow.yml` is called with `build-image: false`** and the frontend image is
+  built by the same `docker-build.yml` call as the backend's. `node-workflow`'s own
+  image job exposes neither `insecure-registry` — the dev Nexus connector is plain
+  HTTP, so BuildKit would fail the push on TLS — nor any of the image scanners.
+
+### From a release tag to a running stack
+
+The git tag *is* the image tag, so a release deploys with the string it was tagged with:
+
+```bash
+git tag 1.2.3 && git push origin 1.2.3   # CI builds, scans and signs the prod images
+
+# then on the swarm manager, in .env:
+#   IMAGE_PREFIX=<NEXUS_DOCKER_REGISTRY_PROD>/   (the trailing slash is part of the value)
+#   IMAGE_TAG=1.2.3
+set -a && . ./.env && set +a
+docker stack deploy -c odata-ui.stack.yml odata-ui-prod
+```
+
+`latest` is pushed too, for tooling that expects it — do not deploy it. Pinning
+`IMAGE_TAG` is what keeps the running version knowable and a rollback a one-line change.
+For a staging deploy, point `IMAGE_PREFIX` at the **dev** registry and `IMAGE_TAG` at
+the branch name or a `sha-<short>` build.
+
+The frontend image job passes `BASE_PATH=/odata-ui/frontend` and
+`NEXT_PUBLIC_API_URL=/odata-ui/frontend` as build args — a path, never a hostname, so
+one image stays valid on any node. Both must agree with the router rule in
+`odata-ui.stack.yml`; see *Ingress*.
+
+### Security gates
+
+| gate | tool | today |
+| --- | --- | --- |
+| Committed secrets | Gitleaks | **blocking**, every trigger |
+| Dockerfile misconfiguration | Checkov | report-only |
+| Image CVEs (`high` and above) | Grype | report-only → `grype-<image>-scan` artifact |
+| Image hardening (CIS) | Dockle | report-only → `dockle-<image>-report` artifact |
+| Dependency inventory | Syft → Dependency-Track | release tags only |
+| Provenance | Cosign | release tags only, signed by digest |
+
+Only the secret scan blocks today. The other three are report-only on purpose: their
+baseline on `python:3.12-slim` and `node:22-alpine` is not yet known, and turning them
+blocking blind would stop the first release on findings inherited from a base image
+rather than on anything this repo wrote. Read one run's artifacts, then flip
+`scan-fail-build`, `lint-image-fail-build` and `scan-dockerfile-soft-fail` in the
+caller, one at a time.
+
+One Checkov finding is already known: `CKV_DOCKER_3` on `backend/Dockerfile` — the
+backend runs as root. Fixing it means adding a non-root `USER` *and* chowning `/data`
+in the image, so the named volume inherits that ownership on first creation; the
+frontend image already runs as `nextjs`.
+
+SBOMs are generated on release tags only, so Dependency-Track gets one project version
+per release instead of one per commit: `odata-ui-frontend` (npm inventory),
+`odata-ui-backend-image` and `odata-ui-frontend-image` (image inventories), each
+versioned by the tag. Verify a release image with:
+
+```bash
+cosign verify --key cosign.pub <registry>/odata-ui-backend@<digest>
+```
+
+### Secrets
+
+Organization-level, passed to every called workflow with `secrets: inherit`. The full
+catalog list is in
+[SECRETS.md](https://github.com/CSC-Operations-Coordination-Service/workflow-catalog/blob/develop/.github/SECRETS.md);
+this repo consumes:
+
+| secret | used for |
+| --- | --- |
+| `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` | pip index for the backend tests; Docker registry login |
+| `NEXUS_DOCKER_REGISTRY_DEV` / `_PROD` | where images are pushed, per context |
+| `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` | SBOM upload (release only) |
+| `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` | image signing (release only) |
+| `GITLEAKS_LICENSE` | required by gitleaks-action on organization repos |
+
+`SONAR_*` and `DOCKERHUB_*` are not used here: there is no SonarQube project for this
+repo yet, and release images go to Nexus only.
+
+### Not wired yet
+
+- **ESLint.** `run-lint` is off because the repo has no eslint config — `next lint`
+  would try to install one interactively and fail on a runner. `next build` still
+  type-checks the whole project, so a type error fails the frontend job today. Add
+  `eslint-config-next` and flip `run-lint` back on.
+- **Frontend tests.** `run-tests` is off; there is no suite.
+- **SonarQube.** Would need a `sonar-project.properties` and a project on the server.
 
 ## Authentication methods
 

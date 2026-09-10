@@ -1,0 +1,92 @@
+# Development stack. Self-contained: `docker compose up` is the whole story.
+#
+# Production is odata-ui.stack.yml, a separate and equally self-contained file.
+# The two share nothing on purpose, so a change here cannot alter production - the
+# cost is that a new backend setting has to be added in both files.
+name: odata-ui
+
+services:
+  backend:
+    build: ./backend
+    image: ${BACKEND_IMAGE:-odata-ui-backend:local}
+    # Source is mounted over the image's copy, so edits restart uvicorn in place.
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+      ]
+    environment:
+      # Required. See .env.example for how to generate one.
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env - see .env.example}
+      DB_PATH: /data/odata_ui.db
+      # Only needed if you point NEXT_PUBLIC_API_URL straight at the backend, or
+      # run the two natively - through the Next proxy nothing is cross-origin.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    volumes:
+      - odata-ui-data:/data
+      - ./backend/app:/app/app
+    # Published for /docs and for calling the API directly; the frontend does not
+    # need it - it reaches the backend over the compose network.
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    # Stated here rather than inherited from the image, because the frontend's
+    # depends_on below waits on it.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    image: ${FRONTEND_IMAGE:-odata-ui-frontend:local}
+    # The dev stage's CMD is the same; spelled out so the dev server is visible
+    # here alongside the backend's --reload.
+    command: ["npm", "run", "dev"]
+    environment:
+      # next dev: Fast Refresh over the bind mount below.
+      NODE_ENV: development
+      # Same origin by default: the browser calls /api/* on this server, which Next
+      # proxies to the backend (see frontend/next.config.mjs). Same path as
+      # production, so a proxy problem shows up here rather than only on deploy.
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/}
+      # The server-side half of that proxy: resolved by Next inside this
+      # container, so it uses the compose service name and the container port -
+      # not the published BACKEND_PORT. Override only for a bare `npm run dev`.
+      BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://backend:8000}
+    volumes:
+      - ./frontend:/app
+      # Anonymous volumes keep the image's node_modules and the build cache from
+      # being masked by the bind mount above.
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  odata-ui-data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.3.0/24

@@ -1,0 +1,47 @@
+version: 2
+
+updates:
+  # The workflow pins actions/checkout and actions/upload-artifact to full commit
+  # SHAs, following the catalog convention. Dependabot bumps the SHA and rewrites
+  # the `# vX.Y.Z` comment, so pinning costs no manual maintenance. The catalog's
+  # own reusable workflows are referenced by `@develop` and are updated there.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+    groups:
+      backend:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+    groups:
+      frontend:
+        patterns:
+          - "*"
+
+  # Base images (python:3.12-slim, node:22-alpine). Grype scans the built image
+  # rather than the Dockerfile, so a stale base surfaces there as CVEs; this
+  # keeps it from getting stale in the first place.
+  - package-ecosystem: "docker"
+    directories:
+      - "/backend"
+      - "/frontend"
+    schedule:
+      interval: "weekly"
+    groups:
+      base-images:
+        patterns:
+          - "*"

@@ -1,0 +1,26 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Data - the SQLite file holds encrypted credentials; never commit it.
+backend/data/
+*.db
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/next-env.d.ts
+*.tsbuildinfo
+
+# Local config
+.env
+.env.prod
+
+# CI reports - produced by the pipeline, uploaded as run artifacts, never committed.
+pytest-report.xml
+coverage.xml
+.coverage
+sbom*.json

@@ -1,0 +1,250 @@
+name: odata-ui CI/CD
+
+# Thin caller for the odata-ui repo. It owns the triggers; every step of real
+# work is delegated to the shared building blocks in the workflow-catalog:
+#
+#   gitleaks.yml      - secret scan of the pushed/PR commits
+#   node-workflow.yml - frontend install -> build (+ npm SBOM on a release)
+#   docker-build.yml  - image build/push + Checkov, Grype, Dockle, SBOM, Cosign
+#
+# The backend has no catalog primitive of its own: python-ci.yml is shaped for a
+# Nexus-published package (tox, setuptools_scm, twine) and this backend is a
+# deployed application, so its tests run in the `backend-test` job below and the
+# image goes straight to docker-build.yml.
+#
+# Triggers and the context they select:
+#
+#   pull_request        -> secret scan + backend tests + frontend build. Nothing
+#                          is pushed: docker-build.yml always pushes what it
+#                          builds, so it is not called on a PR at all.
+#   push main/develop   -> the above + dev-context images in the dev Nexus
+#                          registry, tagged with the branch and `sha-<short>`.
+#   push tag x.y.z      -> the above + prod-context release images tagged
+#                          `x.y.z`, `x.y` and `latest`, signed with Cosign, with
+#                          npm + image SBOMs published to Dependency-Track.
+#   workflow_dispatch   -> manual run of whatever the selected ref implies.
+#
+# `x.y.z` is the tag to put in IMAGE_TAG when deploying odata-ui.stack.yml; see
+# the CI/CD section of README.md.
+#
+# Secrets come from the organization and are passed with `secrets: inherit` -
+# see workflow-catalog/.github/SECRETS.md for the full list.
+
+on:
+  push:
+    branches:
+      - "main"
+      - "develop"
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+" # release tags (x.y.z)
+  pull_request:
+  workflow_dispatch:
+
+# A newer push on the same ref makes older runs moot.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Secret scanning. First gate on every trigger: a committed credential must be
+  # caught before it can reach a pushed image. Runs on ubuntu-latest (the
+  # reusable workflow's default) - it needs nothing from the internal network.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/gitleaks.yml@develop
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Backend tests. A local job rather than a `uses:` - see the header note on
+  # python-ci.yml. It still reuses the catalog's `nexus-context` action, so pip
+  # installs from the same Nexus index as every other build here rather than
+  # needing internet egress from the runner.
+  # ---------------------------------------------------------------------------
+  backend-test:
+    runs-on: self-hosted
+    container:
+      image: python:3.12
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Nexus context
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
+        with:
+          context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Install backend and test dependencies
+        working-directory: backend
+        run: pip install -e ".[dev]"
+
+      # The suite needs no configuration: app/tests/conftest.py sets SECRET_KEY
+      # and an in-memory DB_PATH before the app is imported.
+      - name: Run tests
+        working-directory: backend
+        run: pytest -q --junitxml=pytest-report.xml
+
+      - name: Upload test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: backend-test-report
+          path: backend/pytest-report.xml
+          if-no-files-found: warn
+        env:
+          # One small XML file; extra parallel TLS connections to Azure only add
+          # chances for a corporate firewall to reset the batch.
+          ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: "2"
+
+      # This job container runs as root and $GITHUB_WORKSPACE is bind-mounted in
+      # from the host, so everything it writes - including checkout's .git/ - is
+      # left owned by uid 0. On a self-hosted runner the next job of the run
+      # reuses that same directory, and docker-build.yml's `docker` job has no
+      # `container:`, so it runs as the unprivileged runner user and its checkout
+      # dies with "EACCES: permission denied, unlink '.git/FETCH_HEAD'". Hand
+      # ownership back; $RUNNER_TEMP carries the host uid/gid through the mount.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Frontend CI. node-workflow.yml is used as a primitive here (build-image is
+  # false) rather than as the all-in-one: its `docker` job does not expose
+  # insecure-registry or any of the image scanners, and the dev Nexus connector
+  # is plain HTTP - BuildKit would fail the push on TLS. The frontend image is
+  # therefore built by the same docker-build.yml call as the backend's, with the
+  # same security settings.
+  # ---------------------------------------------------------------------------
+  frontend-ci:
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@develop
+    with:
+      working-directory: frontend
+      node-version: "22"
+      # No eslint config in this repo yet: `next lint` would try to install one
+      # interactively and hang or fail on a runner. `next build` below still
+      # type-checks the whole project - next.config.mjs does not set
+      # typescript.ignoreBuildErrors - so a type error fails this job today.
+      # Flip this back on together with adding eslint-config-next.
+      run-lint: false
+      run-build: true
+      # No frontend test suite yet.
+      run-tests: false
+      # Mirrors the image build below, so the CI compile exercises the same
+      # configuration the shipped bundle is built with.
+      build-env: |
+        NEXT_PUBLIC_API_URL=/odata-ui/frontend
+        BASE_PATH=/odata-ui/frontend
+      # Release only, so Dependency-Track gets one project version per release
+      # rather than one per commit to main.
+      generate-sbom: ${{ startsWith(github.ref, 'refs/tags/') }}
+      sbom-project-name: odata-ui-frontend
+      sbom-project-version: ${{ github.ref_name }}
+      # Names the SBOM artifact only; the image is built by frontend-image below.
+      image-name: odata-ui-frontend
+      build-image: false
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Backend image. Never on a pull request: docker-build.yml always pushes what
+  # it builds.
+  # ---------------------------------------------------------------------------
+  backend-image:
+    needs: backend-test
+    if: github.event_name != 'pull_request'
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
+    with:
+      image-name: odata-ui-backend
+      context: backend
+      dockerfile: backend/Dockerfile
+      # Tags: release -> x.y.z + x.y + latest; otherwise branch + sha-<short>.
+      release: ${{ startsWith(github.ref, 'refs/tags/') }}
+      environment: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
+      # The dev Docker connector is plain HTTP - an https probe against it fails
+      # with a TLS "packet length too long" - and it is listed in the runner
+      # daemon's insecure-registries. Whether the prod connector is plain HTTP
+      # too has not been verified, so releases are left on TLS; if a release
+      # fails at the push with a TLS error, drop the condition and pass true.
+      insecure-registry: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      # Report-only for now, deliberately. Checkov flags CKV_DOCKER_3 on this
+      # Dockerfile (no USER - the app runs as root), which is a real finding but
+      # not one to discover by having it block the first pipeline run; giving the
+      # backend a non-root user also means chowning /data so the named volume
+      # inherits the right ownership. Soft-fail additionally keeps the build
+      # alive when the runner cannot reach ghcr.io for the checkov container.
+      scan-dockerfile: true
+      scan-dockerfile-soft-fail: true
+      # Grype and Dockle report without blocking until their baseline on
+      # python:3.12-slim is known - a first release must not be held hostage to
+      # whatever the base image carries. Reports land as run artifacts
+      # (grype-odata-ui-backend-scan, dockle-odata-ui-backend-report).
+      scan-image: true
+      scan-severity-cutoff: high
+      scan-fail-build: false
+      lint-image: true
+      lint-image-failure-threshold: WARN
+      lint-image-fail-build: false
+      generate-sbom: ${{ startsWith(github.ref, 'refs/tags/') }}
+      sbom-project-name: odata-ui-backend-image
+      sbom-project-version: ${{ github.ref_name }}
+      sign-image: ${{ startsWith(github.ref, 'refs/tags/') }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Frontend image. Same settings as the backend's, plus the two build args that
+  # decide where the app lives, both inlined into the bundle at build time:
+  #
+  #   BASE_PATH           moves the server and every asset URL and <Link>
+  #   NEXT_PUBLIC_API_URL moves the fetch() calls, which Next does not prefix
+  #
+  # Both are the ingress path, because odata-ui.stack.yml routes the frontend on
+  # http://<NODE_IP>/odata-ui/frontend through Traefik *without* stripping the
+  # prefix. They must agree with each other and with the router rule in the stack
+  # file; a mismatch is a page that loads with no CSS, or a UI that 404s every
+  # API call. Still no hostname in the image - only a path - so one image stays
+  # valid on any node.
+  # ---------------------------------------------------------------------------
+  frontend-image:
+    needs: frontend-ci
+    if: github.event_name != 'pull_request'
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
+    with:
+      image-name: odata-ui-frontend
+      context: frontend
+      dockerfile: frontend/Dockerfile
+      build-args: |
+        NEXT_PUBLIC_API_URL=/odata-ui/frontend
+        BASE_PATH=/odata-ui/frontend
+      release: ${{ startsWith(github.ref, 'refs/tags/') }}
+      environment: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
+      insecure-registry: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      # This Dockerfile already has a non-root USER and a HEALTHCHECK; kept
+      # report-only for the same ghcr.io-egress reason as the backend's.
+      scan-dockerfile: true
+      scan-dockerfile-soft-fail: true
+      scan-image: true
+      scan-severity-cutoff: high
+      scan-fail-build: false
+      lint-image: true
+      lint-image-failure-threshold: WARN
+      lint-image-fail-build: false
+      generate-sbom: ${{ startsWith(github.ref, 'refs/tags/') }}
+      sbom-project-name: odata-ui-frontend-image
+      sbom-project-version: ${{ github.ref_name }}
+      sign-image: ${{ startsWith(github.ref, 'refs/tags/') }}
+    secrets: inherit

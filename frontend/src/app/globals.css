@@ -1,0 +1,382 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #dfe3e8;
+  --fg: #14181d;
+  --muted: #5f6b7a;
+  --accent: #1f6feb;
+
+  /* Backdrop-only tokens. */
+  --nebula-2: #7b5cff;
+  --lattice: rgba(31, 111, 235, 0.28);
+  --star: rgba(60, 80, 120, 0.55);
+  --surface-alpha: 0.86;
+  --shadow-hover: 0 6px 20px -8px rgba(20, 30, 60, 0.28);
+
+  /* One easing for everything, so the whole UI moves with the same character. */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0e14;
+    --surface: #161b22;
+    --border: #2a313c;
+    --fg: #e6edf3;
+    --muted: #93a1b1;
+    --accent: #4f9dff;
+
+    --nebula-2: #a06cff;
+    --lattice: rgba(120, 170, 255, 0.20);
+    --star: rgba(200, 220, 255, 0.85);
+    --surface-alpha: 0.72;
+    --shadow-hover: 0 8px 26px -10px rgba(0, 0, 0, 0.75);
+  }
+}
+
+/* The page background lives on <html> alone. A background on <body> would paint in
+   the block-background phase, i.e. above any negative-z-index layer, and would hide
+   the backdrop entirely. */
+html {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+body {
+  background: transparent;
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ---------------------------------------------------------------- backdrop -- */
+
+.space-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -10;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.space-backdrop-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.star {
+  fill: var(--star);
+  animation: twinkle 5.5s var(--ease) infinite;
+}
+
+.orbit {
+  fill: none;
+  stroke: var(--accent);
+  stroke-opacity: 0.18;
+  stroke-width: 1;
+  stroke-dasharray: 5 9;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.orbit-slow {
+  animation: spin 90s linear infinite;
+}
+.orbit-slower {
+  animation: spin 150s linear infinite reverse;
+}
+
+.iso-face-top {
+  fill: var(--accent);
+  fill-opacity: 0.15;
+}
+.iso-face-left {
+  fill: var(--accent);
+  fill-opacity: 0.09;
+}
+.iso-face-right {
+  fill: var(--accent);
+  fill-opacity: 0.05;
+}
+.iso-edge {
+  stroke: var(--accent);
+  stroke-opacity: 0.3;
+  stroke-width: 1;
+}
+
+.drift {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.drift-a {
+  animation: float 19s ease-in-out infinite;
+}
+.drift-b {
+  animation: float 25s ease-in-out infinite reverse;
+}
+.drift-c {
+  animation: float 31s ease-in-out infinite 2s;
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-18px) rotate(1.5deg);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* -------------------------------------------------------------- transitions -- */
+
+@keyframes page-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.page-enter {
+  animation: page-enter 0.42s var(--ease-out) both;
+}
+
+.rise-in {
+  animation: rise 0.35s var(--ease-out) both;
+}
+
+.scale-in {
+  animation: scale-in 0.22s var(--ease-out) both;
+}
+
+.fade-in {
+  animation: fade-in 0.3s var(--ease) both;
+}
+
+/* Staggers a short list — grid cards, result rows — into view. Capped at 12 so a
+   1000-row table does not spend a second animating. */
+.stagger > *:nth-child(1) { animation-delay: 0.02s; }
+.stagger > *:nth-child(2) { animation-delay: 0.05s; }
+.stagger > *:nth-child(3) { animation-delay: 0.08s; }
+.stagger > *:nth-child(4) { animation-delay: 0.11s; }
+.stagger > *:nth-child(5) { animation-delay: 0.14s; }
+.stagger > *:nth-child(6) { animation-delay: 0.17s; }
+.stagger > *:nth-child(7) { animation-delay: 0.2s; }
+.stagger > *:nth-child(8) { animation-delay: 0.23s; }
+.stagger > *:nth-child(9) { animation-delay: 0.26s; }
+.stagger > *:nth-child(10) { animation-delay: 0.29s; }
+.stagger > *:nth-child(11) { animation-delay: 0.32s; }
+.stagger > *:nth-child(12) { animation-delay: 0.35s; }
+
+@layer components {
+  /* Form controls: one definition, used everywhere. */
+  .input,
+  .select,
+  .textarea {
+    @apply w-full rounded-md border px-2.5 py-1.5 text-sm text-fg outline-none;
+    border-color: var(--border);
+    background: color-mix(in srgb, var(--surface) 92%, transparent);
+    transition:
+      border-color 0.18s var(--ease),
+      box-shadow 0.18s var(--ease),
+      background-color 0.18s var(--ease);
+  }
+  .input:hover:not(:focus),
+  .select:hover:not(:focus),
+  .textarea:hover:not(:focus) {
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  }
+  .input:focus,
+  .select:focus,
+  .textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  .textarea {
+    @apply mono resize-y;
+  }
+
+  /* Placeholders are hints, not values - keep them clearly recessive in both themes. */
+  .input::placeholder,
+  .textarea::placeholder {
+    color: var(--muted);
+    opacity: 0.55;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md border px-3 py-1.5
+           text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50;
+    border-color: var(--border);
+    background: color-mix(in srgb, var(--surface) 90%, transparent);
+    color: var(--fg);
+    transition:
+      border-color 0.18s var(--ease),
+      background-color 0.18s var(--ease),
+      color 0.18s var(--ease),
+      box-shadow 0.18s var(--ease),
+      transform 0.12s var(--ease);
+  }
+  .btn:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  }
+  .btn:active:not(:disabled) {
+    transform: translateY(1px) scale(0.985);
+  }
+  .btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--accent);
+    filter: brightness(1.1);
+    box-shadow: 0 4px 14px -4px color-mix(in srgb, var(--accent) 65%, transparent);
+  }
+  .btn-danger {
+    color: #d1242f;
+  }
+  .btn-danger:hover:not(:disabled) {
+    border-color: color-mix(in srgb, #d1242f 45%, var(--border));
+    background: color-mix(in srgb, #d1242f 8%, var(--surface));
+  }
+  .btn-sm {
+    @apply px-2 py-1 text-xs;
+  }
+
+  /* Surfaces are slightly translucent so the backdrop reads through the layout —
+     enough to feel like glass, not enough to hurt table legibility. */
+  .card {
+    @apply rounded-lg border;
+    border-color: var(--border);
+    background: color-mix(in srgb, var(--surface) calc(var(--surface-alpha) * 100%), transparent);
+    backdrop-filter: blur(10px);
+    transition:
+      border-color 0.22s var(--ease),
+      box-shadow 0.22s var(--ease),
+      transform 0.22s var(--ease);
+  }
+
+  /* Opt-in lift, for cards that are actually links or buttons. */
+  .card-interactive:hover {
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+    box-shadow: var(--shadow-hover);
+    transform: translateY(-2px);
+  }
+
+  .label {
+    @apply mb-1 block text-xs font-medium;
+    color: var(--muted);
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs;
+    border-color: var(--border);
+    color: var(--muted);
+    background: color-mix(in srgb, var(--surface) 55%, transparent);
+    transition: border-color 0.18s var(--ease), color 0.18s var(--ease);
+  }
+
+  /* Table rows and nav links share the same hover feel as everything else. */
+  .row-hover {
+    transition: background-color 0.15s var(--ease);
+  }
+  .row-hover:hover {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+}
+
+/* Respect the user's motion preference: keep the visuals, drop the movement. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .card-interactive:hover {
+    transform: none;
+  }
+}
+
+/* A healthy endpoint breathes; a failing one stays still so it reads as a fault. */
+@keyframes status-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse) 55%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--pulse) 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse) 0%, transparent);
+  }
+}
+
+.status-pulse {
+  animation: status-pulse 2.6s var(--ease) infinite;
+}
